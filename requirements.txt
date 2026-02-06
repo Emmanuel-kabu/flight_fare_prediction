@@ -1,0 +1,25 @@
+# data visualization
+# Data
+numpy
+pandas
+
+# Data visualization (optional)
+matplotlib
+seaborn
+
+# ML
+scikit-learn
+xgboost
+
+# API / serving
+fastapi
+uvicorn[standard]
+pydantic
+
+# Experiment tracking / model registry
+mlflow
+boto3
+psycopg2-binary
+
+# Model monitoring
+evidently

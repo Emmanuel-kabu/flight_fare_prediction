@@ -2,6 +2,7 @@
 # Data
 numpy
 pandas
+pyarrow
 
 # Data visualization (optional)
 matplotlib
@@ -10,6 +11,8 @@ seaborn
 # ML
 scikit-learn
 xgboost
+catboost
+lightgbm
 
 # API / serving
 fastapi

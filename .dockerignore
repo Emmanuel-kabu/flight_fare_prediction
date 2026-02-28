@@ -1,0 +1,37 @@
+# Virtual environments
+flight_env/
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+
+# Git
+.git/
+.gitignore
+
+# Docker
+docker/
+
+# Notebooks cache (not data — needed by training)
+notebooks/catboost_info/
+
+# MLflow local runs (use container volumes instead)
+mlruns/
+
+# Local reports (use container volumes instead)
+reports/
+
+# Local artifacts
+artifacts/
+
+# OS files
+*.DS_Store
+Thumbs.db

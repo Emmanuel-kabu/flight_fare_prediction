@@ -1,0 +1,17 @@
+# ── Custom Airflow image with ML dependencies ───────────────────────────────
+# Extends the official Apache Airflow image with the Python libraries needed
+# by the ML pipeline tasks (catboost, mlflow, evidently, etc.).
+FROM apache/airflow:2.9.3-python3.11
+
+USER root
+
+# System deps for catboost / psycopg2
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends gcc libpq-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+USER airflow
+
+# Install ML dependencies into the Airflow Python environment
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt

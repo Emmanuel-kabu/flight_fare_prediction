@@ -1,0 +1,40 @@
+# Virtual environments
+flight_env/
+venv/
+.venv/
+env/
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment / secrets
+.env
+.env.*
+docker/.env
+
+# MLflow local runs
+mlruns/
+
+# CatBoost temp
+catboost_info/
+notebooks/catboost_info/
+
+# Model artifacts (large binaries)
+artifacts/
+
+# Monitoring reports (generated)
+reports/
+
+# Notebook checkpoints
+.ipynb_checkpoints/

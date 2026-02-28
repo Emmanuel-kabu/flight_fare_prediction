@@ -36,6 +36,8 @@ x-airflow-common: &airflow-common
     SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
     CHANNEL_NAME: ${CHANNEL_NAME:-ml_pipeline_report}
     AIRFLOW_UI_BASE_URL: http://localhost:8082
+    # FastAPI endpoint (for reload after retraining)
+    FASTAPI_BASE_URL: http://fastapi:8000
   volumes:
     - ../orchestration:/opt/airflow/dags
     - ..:/opt/airflow/project

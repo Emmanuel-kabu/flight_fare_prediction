@@ -1,15 +1,19 @@
 """
 FastAPI backend for Flight Fare Prediction.
 
-Loads the trained CatBoost model and fitted preprocessor from pickle artifacts,
-exposes a /predict endpoint that accepts raw flight details and returns the
-predicted fare in BDT.
+Loads the trained model (champion from continuous training) and fitted
+preprocessor from pickle artifacts, exposes:
+  - /predict  — returns predicted fare in BDT
+  - /reload   — hot-swap model artifacts after retraining (POST)
+  - /health   — readiness probe
+  - /options  — dropdown values for the frontend
 """
 
 from __future__ import annotations
 
 import pickle
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -27,37 +31,51 @@ from model.training.preprocessing import FlightFarePreprocessor
 
 # ── Paths ───────────────────────────────────────────────────────────────────
 ARTIFACTS_DIR = PROJECT_ROOT / "artifacts"
-MODEL_PATH = ARTIFACTS_DIR / "catboost_model.pkl"
+# Champion model path (written by ContinuousTrainer.save_champion)
+# Falls back to catboost_model.pkl for backward compatibility
+CHAMPION_MODEL_PATH = ARTIFACTS_DIR / "champion_model.pkl"
+LEGACY_MODEL_PATH = ARTIFACTS_DIR / "catboost_model.pkl"
 PREPROCESSOR_PATH = ARTIFACTS_DIR / "preprocessor.pkl"
 
 
-# ── Load artifacts at startup ───────────────────────────────────────────────
+# ── Load artifacts ──────────────────────────────────────────────────────────
 def _load_artifacts():
-    if not MODEL_PATH.exists() or not PREPROCESSOR_PATH.exists():
+    """Load model and preprocessor from disk. Returns (model, preprocessor, model_info)."""
+    model_path = CHAMPION_MODEL_PATH if CHAMPION_MODEL_PATH.exists() else LEGACY_MODEL_PATH
+
+    if not model_path.exists() or not PREPROCESSOR_PATH.exists():
         print(
             f"[WARNING] Artifacts not found at {ARTIFACTS_DIR}. "
             "The /predict endpoint will return 503 until the training pipeline runs."
         )
-        return None, None
+        return None, None, {}
 
-    with open(MODEL_PATH, "rb") as f:
+    with open(model_path, "rb") as f:
         model = pickle.load(f)
     with open(PREPROCESSOR_PATH, "rb") as f:
         preprocessor = pickle.load(f)
 
-    return model, preprocessor
+    model_info = {
+        "model_path": str(model_path),
+        "model_class": type(model).__name__,
+        "loaded_at": datetime.now(timezone.utc).isoformat(),
+    }
+    print(f"[Serving] Loaded {model_info['model_class']} from {model_path}")
+
+    return model, preprocessor, model_info
 
 
-model, preprocessor = _load_artifacts()
+model, preprocessor, model_info = _load_artifacts()
 
 # ── FastAPI app ─────────────────────────────────────────────────────────────
 app = FastAPI(
     title="Flight Fare Prediction API",
     description=(
         "Predict domestic & international flight fares from Bangladesh "
-        "using a CatBoost model."
+        "using the champion model from continuous training "
+        "(RandomForest / XGBoost / LightGBM / CatBoost)."
     ),
-    version="1.0.0",
+    version="2.0.0",
 )
 
 app.add_middleware(
@@ -132,7 +150,40 @@ class OptionsResponse(BaseModel):
 # ── Endpoints ───────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
-    return {"status": "ok", "model_loaded": model is not None}
+    return {
+        "status": "ok",
+        "model_loaded": model is not None,
+        "model_class": model_info.get("model_class", "N/A"),
+        "loaded_at": model_info.get("loaded_at", "N/A"),
+    }
+
+
+@app.post("/reload")
+def reload_model():
+    """
+    Hot-swap model artifacts after retraining.
+    Called by the continuous training DAG after champion is saved.
+    """
+    global model, preprocessor, model_info
+    try:
+        new_model, new_preprocessor, new_info = _load_artifacts()
+        if new_model is None or new_preprocessor is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Artifacts not found. Cannot reload.",
+            )
+        model = new_model
+        preprocessor = new_preprocessor
+        model_info = new_info
+        return {
+            "status": "reloaded",
+            "model_class": new_info.get("model_class"),
+            "loaded_at": new_info.get("loaded_at"),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Reload failed: {e}")
 
 
 @app.get("/options", response_model=OptionsResponse)
@@ -155,10 +206,10 @@ def predict(payload: FlightInput):
     """
     Accept raw flight details, run preprocessing, and return predicted fare.
     """
-    global model, preprocessor
+    global model, preprocessor, model_info
     # Lazy-load: try loading artifacts if they weren't available at startup
     if model is None or preprocessor is None:
-        model, preprocessor = _load_artifacts()
+        model, preprocessor, model_info = _load_artifacts()
     if model is None or preprocessor is None:
         raise HTTPException(
             status_code=503,

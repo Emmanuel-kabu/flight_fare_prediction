@@ -2,9 +2,14 @@
 Model Store — MLflow experiment tracking & model registry.
 
 Logs hyper-parameters, training metrics, evaluation results, feature
-importances, and the CatBoost model artefact to MLflow.  Optionally
-registers the model in the MLflow Model Registry for stage promotion
-(Staging → Production).
+importances, and model artefacts to MLflow for multiple model types:
+  - RandomForest (sklearn)
+  - XGBoost
+  - LightGBM
+  - CatBoost
+
+Optionally registers the model in the MLflow Model Registry for
+stage promotion (Staging → Production).
 
 Usage
 -----
@@ -15,6 +20,7 @@ Usage
         model=trainer.model,
         params=trainer.params,
         metrics=metrics,
+        model_type="CatBoost",
         feature_importances=trainer.feature_importances,
         X_train=X_train,
         preprocessor=preprocessor,
@@ -34,8 +40,27 @@ from typing import Any, Dict, List, Optional
 import mlflow
 import mlflow.catboost
 import mlflow.pyfunc
+import mlflow.sklearn
+import mlflow.xgboost
+import mlflow.lightgbm
 import numpy as np
 import pandas as pd
+
+# Mapping of model type → model family tag
+MODEL_FAMILY_MAP = {
+    "RandomForest": "ensemble_bagging",
+    "XGBoost": "gradient_boosting",
+    "LightGBM": "gradient_boosting",
+    "CatBoost": "gradient_boosting",
+}
+
+# Mapping of model type → MLflow logging flavour
+MODEL_LOG_FLAVOUR = {
+    "RandomForest": "sklearn",
+    "XGBoost": "xgboost",
+    "LightGBM": "lightgbm",
+    "CatBoost": "catboost",
+}
 
 
 class ModelStore:
@@ -44,7 +69,7 @@ class ModelStore:
 
     Responsibilities:
     * Log every training run (params, metrics, artefacts)
-    * Store the CatBoost model via ``mlflow.catboost``
+    * Store models using the correct MLflow flavour per type
     * Store the preprocessor pickle as an artefact
     * Register models in the MLflow Model Registry
     * Load models for inference from the registry
@@ -74,23 +99,26 @@ class ModelStore:
         model: Any,
         params: Dict[str, Any],
         metrics: Dict[str, float],
+        model_type: str = "CatBoost",
         feature_importances: Optional[pd.Series] = None,
         X_train: Optional[pd.DataFrame] = None,
         preprocessor: Any = None,
         run_name: Optional[str] = None,
         tags: Optional[Dict[str, str]] = None,
+        is_champion: bool = False,
     ) -> str:
         """
         Log a full training run to MLflow.
 
         Parameters
         ----------
-        model : CatBoostRegressor
-            Trained CatBoost model instance.
+        model : trained model instance.
         params : dict
             Hyperparameters used for training.
         metrics : dict
             Evaluation metrics (R2, MAE, RMSE, MAPE, MedAE).
+        model_type : str
+            One of: RandomForest, XGBoost, LightGBM, CatBoost.
         feature_importances : pd.Series, optional
             Feature importance scores from the model.
         X_train : pd.DataFrame, optional
@@ -101,15 +129,26 @@ class ModelStore:
             Human-readable name for the run.
         tags : dict, optional
             Additional MLflow tags.
+        is_champion : bool
+            If True, tag this run as the champion model.
 
         Returns
         -------
         str   The MLflow run ID.
         """
-        with mlflow.start_run(run_name=run_name or "catboost-training") as run:
+        default_run_name = f"{model_type.lower()}-training"
+        flavour = MODEL_LOG_FLAVOUR.get(model_type, "sklearn")
+        family = MODEL_FAMILY_MAP.get(model_type, "unknown")
+
+        with mlflow.start_run(run_name=run_name or default_run_name) as run:
             # ── Tags ────────────────────────────────────────────────────
             mlflow.set_tag("stage", "training")
-            mlflow.set_tag("model_type", "CatBoostRegressor")
+            mlflow.set_tag("model_type", model_type)
+            mlflow.set_tag("model_family", family)
+            mlflow.set_tag("mlflow_flavour", flavour)
+            if is_champion:
+                mlflow.set_tag("champion", "true")
+                mlflow.set_tag("stage", "champion")
             if tags:
                 mlflow.set_tags(tags)
 
@@ -124,13 +163,15 @@ class ModelStore:
             for metric_name, metric_val in metrics.items():
                 mlflow.log_metric(metric_name, metric_val)
 
-            # Best iteration
+            # Model-specific metrics
             best_iter = getattr(model, "best_iteration_", None)
             if best_iter is not None:
                 mlflow.log_metric("best_iteration", best_iter)
-            mlflow.log_metric("tree_count", model.tree_count_)
+            tree_count = getattr(model, "tree_count_", None)
+            if tree_count is not None:
+                mlflow.log_metric("tree_count", tree_count)
 
-            # ── Model artefact ──────────────────────────────────────────
+            # ── Model artefact (flavour-aware) ──────────────────────────
             input_example = None
             signature = None
             if X_train is not None:
@@ -143,9 +184,9 @@ class ModelStore:
                     input_example = None
                     signature = None
 
-            mlflow.catboost.log_model(
-                cb_model=model,
-                artifact_path="model",
+            self._log_model_by_flavour(
+                model=model,
+                flavour=flavour,
                 signature=signature,
                 input_example=input_example,
             )
@@ -162,7 +203,6 @@ class ModelStore:
                     )
                     mlflow.log_artifact(str(fi_path), artifact_path="evaluation")
 
-                    # Also log as a CSV for quick viewing
                     fi_csv = Path(tmpdir) / "feature_importances.csv"
                     feature_importances.reset_index().rename(
                         columns={"index": "feature", 0: "importance"}
@@ -176,7 +216,7 @@ class ModelStore:
                         pickle.dump(preprocessor, f)
                     mlflow.log_artifact(str(prep_path), artifact_path="preprocessor")
 
-                # Params JSON (for easy retrieval)
+                # Params JSON
                 params_path = Path(tmpdir) / "training_params.json"
                 params_path.write_text(
                     json.dumps(params, indent=2, default=str)
@@ -186,11 +226,85 @@ class ModelStore:
             run_id = run.info.run_id
             print(
                 f"[ModelStore] Training run logged — "
-                f"run_id={run_id}  "
+                f"model={model_type}  run_id={run_id}  "
                 f"R2={metrics.get('R2', 'N/A'):.4f}  "
                 f"MAE={metrics.get('MAE', 'N/A'):,.0f}"
             )
             return run_id
+
+    # ── Log all retraining results at once ──────────────────────────────────
+
+    def log_retraining_results(
+        self,
+        results: list,
+        champion_name: str,
+        preprocessor: Any = None,
+        X_train: Optional[pd.DataFrame] = None,
+    ) -> Dict[str, str]:
+        """
+        Log all model results from a ContinuousTrainer session.
+
+        Parameters
+        ----------
+        results : list of ModelResult
+        champion_name : str
+            Name of the champion model.
+        preprocessor : optional preprocessor object.
+        X_train : optional training data for signature inference.
+
+        Returns
+        -------
+        dict  mapping model_name → run_id.
+        """
+        run_ids: Dict[str, str] = {}
+
+        for result in results:
+            is_champ = result.model_name == champion_name
+            run_id = self.log_training_run(
+                model=result.model,
+                params=result.params,
+                metrics=result.metrics,
+                model_type=result.model_name,
+                feature_importances=result.feature_importances,
+                X_train=X_train,
+                preprocessor=preprocessor if is_champ else None,
+                run_name=f"retrain-{result.model_name.lower()}",
+                tags={
+                    "training_time_seconds": str(result.training_time_seconds),
+                    "retrain": "true",
+                },
+                is_champion=is_champ,
+            )
+            run_ids[result.model_name] = run_id
+
+        return run_ids
+
+    # ── Flavour-aware model logging ─────────────────────────────────────────
+
+    @staticmethod
+    def _log_model_by_flavour(
+        model: Any,
+        flavour: str,
+        signature: Any = None,
+        input_example: Any = None,
+    ) -> None:
+        """Log a model using the appropriate MLflow flavour."""
+        kwargs = dict(
+            artifact_path="model",
+            signature=signature,
+            input_example=input_example,
+        )
+        if flavour == "catboost":
+            mlflow.catboost.log_model(cb_model=model, **kwargs)
+        elif flavour == "xgboost":
+            mlflow.xgboost.log_model(xgb_model=model, **kwargs)
+        elif flavour == "lightgbm":
+            mlflow.lightgbm.log_model(lgb_model=model, **kwargs)
+        elif flavour == "sklearn":
+            mlflow.sklearn.log_model(sk_model=model, **kwargs)
+        else:
+            # Generic fallback
+            mlflow.sklearn.log_model(sk_model=model, **kwargs)
 
     # ── Model Registry ──────────────────────────────────────────────────────
 
@@ -276,9 +390,12 @@ class ModelStore:
         """
         Load the latest Production model from the MLflow Model Registry.
 
+        Tries alias-based loading first, then falls back to latest version.
+        Uses ``mlflow.pyfunc`` for flavour-agnostic loading.
+
         Returns
         -------
-        CatBoostRegressor
+        Loaded model (any flavour).
         """
         model_name = model_name or self.REGISTERED_MODEL_NAME
         client = mlflow.MlflowClient()
@@ -297,7 +414,8 @@ class ModelStore:
             latest = sorted(versions, key=lambda v: int(v.version))[-1]
             model_uri = f"models:/{model_name}/{latest.version}"
 
-        model = mlflow.catboost.load_model(model_uri)
+        # Use pyfunc for flavour-agnostic loading
+        model = mlflow.pyfunc.load_model(model_uri)
         print(f"[ModelStore] Loaded model from {model_uri}")
         return model
 

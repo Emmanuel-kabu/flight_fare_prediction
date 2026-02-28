@@ -11,6 +11,7 @@ preprocessor from pickle artifacts, exposes:
 
 from __future__ import annotations
 
+import os
 import pickle
 import sys
 from datetime import datetime, timezone
@@ -66,6 +67,9 @@ def _load_artifacts():
 
 
 model, preprocessor, model_info = _load_artifacts()
+
+# ── Instance identity (for load-balanced replicas) ──────────────────────────
+INSTANCE_ID = os.getenv("INSTANCE_ID", "0")
 
 # ── FastAPI app ─────────────────────────────────────────────────────────────
 app = FastAPI(
@@ -152,6 +156,7 @@ class OptionsResponse(BaseModel):
 def health():
     return {
         "status": "ok",
+        "instance_id": INSTANCE_ID,
         "model_loaded": model is not None,
         "model_class": model_info.get("model_class", "N/A"),
         "loaded_at": model_info.get("loaded_at", "N/A"),
@@ -177,6 +182,7 @@ def reload_model():
         model_info = new_info
         return {
             "status": "reloaded",
+            "instance_id": INSTANCE_ID,
             "model_class": new_info.get("model_class"),
             "loaded_at": new_info.get("loaded_at"),
         }

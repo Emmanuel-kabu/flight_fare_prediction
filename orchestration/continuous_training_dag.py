@@ -361,8 +361,8 @@ def task_log_to_mlflow(**context):
 
 def task_reload_endpoint(**context):
     """
-    Trigger the prediction endpoint to reload with the new champion model.
-    The FastAPI app exposes a /reload endpoint for this purpose.
+    Broadcast reload to ALL FastAPI replicas behind the load balancer.
+    Each replica loads model artifacts from the shared volume independently.
     """
     import requests
     from orchestration.slack_notifications import (
@@ -374,41 +374,47 @@ def task_reload_endpoint(**context):
     champion_name = ti.xcom_pull(task_ids="train_all_models", key="champion_name")
     model_version = ti.xcom_pull(task_ids="log_to_mlflow", key="model_version") or "N/A"
 
-    fastapi_url = os.getenv("FASTAPI_BASE_URL", "http://fastapi-server:8000")
-    reload_url = f"{fastapi_url}/reload"
+    # Get replica URLs — broadcast reload to each one
+    replicas_str = os.getenv(
+        "FASTAPI_REPLICAS",
+        "http://fastapi-1:8000,http://fastapi-2:8000,http://fastapi-3:8000",
+    )
+    replica_urls = [u.strip() for u in replicas_str.split(",") if u.strip()]
+    lb_url = os.getenv("FASTAPI_BASE_URL", "http://nginx-lb:80")
 
-    try:
-        resp = requests.post(reload_url, timeout=30)
-        if resp.status_code == 200:
-            print(f"[ContinuousTraining] Endpoint reloaded successfully")
-            notify_model_promoted(
-                model_name=champion_name,
-                model_version=str(model_version),
-                endpoint_url=f"{fastapi_url}/predict",
-                context=context,
-            )
-            return {"status": "reloaded", "champion": champion_name}
-        else:
-            msg = f"Endpoint reload returned {resp.status_code}: {resp.text}"
-            print(f"[ContinuousTraining] WARNING: {msg}")
-            # Still notify promotion — model is saved even if reload failed
-            notify_model_promoted(
-                model_name=champion_name,
-                model_version=str(model_version),
-                endpoint_url=f"{fastapi_url}/predict",
-                context=context,
-            )
-            return {"status": "partial", "warning": msg}
-    except Exception as e:
-        print(f"[ContinuousTraining] Endpoint reload failed: {e}")
-        # Model is still saved to artifacts — endpoint will pick it up on restart
-        notify_model_promoted(
-            model_name=champion_name,
-            model_version=str(model_version),
-            endpoint_url=f"{fastapi_url}/predict",
-            context=context,
-        )
-        return {"status": "saved_but_reload_failed", "error": str(e)}
+    reloaded = []
+    failed = []
+
+    for url in replica_urls:
+        try:
+            resp = requests.post(f"{url}/reload", timeout=30)
+            if resp.status_code == 200:
+                reloaded.append(url)
+                print(f"[ContinuousTraining] Reloaded: {url}")
+            else:
+                failed.append(f"{url} → {resp.status_code}")
+                print(f"[ContinuousTraining] Reload warning: {url} → {resp.status_code}")
+        except Exception as e:
+            failed.append(f"{url} → {e}")
+            print(f"[ContinuousTraining] Reload failed: {url} → {e}")
+
+    # Notify promotion regardless — model is saved to shared volume
+    notify_model_promoted(
+        model_name=champion_name,
+        model_version=str(model_version),
+        endpoint_url=f"{lb_url}/predict",
+        context=context,
+    )
+
+    summary = {
+        "status": "all_reloaded" if not failed else "partial",
+        "champion": champion_name,
+        "reloaded": len(reloaded),
+        "failed": len(failed),
+        "details": failed if failed else "all replicas reloaded",
+    }
+    print(f"[ContinuousTraining] Reload summary: {summary}")
+    return summary
 
 
 def task_notify_failure(context):

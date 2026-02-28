@@ -23,8 +23,9 @@ This starts all services:
 
 | Service | URL | Description |
 |---------|-----|-------------|
+| **Nginx LB** | [localhost:8003](http://localhost:8003/lb-health) | Load balancer — round-robin across 3 FastAPI replicas |
 | **Streamlit UI** | [localhost:8501](http://localhost:8501) | Interactive fare prediction interface |
-| **FastAPI** | [localhost:8003/docs](http://localhost:8003/docs) | REST API with Swagger docs |
+| **FastAPI ×3** | *(internal only)* | REST API replicas behind Nginx LB |
 | **MLflow** | [localhost:5000](http://localhost:5000) | Experiment tracking & model registry |
 | **Airflow** | [localhost:8082](http://localhost:8082) | Pipeline orchestration (user: `airflow` / pass: `airflow`) |
 | **Evidently** | [localhost:8001](http://localhost:8001) | Data & concept drift dashboards |
@@ -74,6 +75,9 @@ flight_fare_prediction/
 │   └── experiment_with_leaky.ipynb  # Leakage analysis notebook
 ├── docker/
 │   ├── docker-compose-ml.yml       # Full stack compose file
+│   ├── nginx/
+│   │   └── nginx.conf               # Nginx LB config (round-robin, health checks)
+│   ├── Dockerfile.nginx             # Nginx load balancer image
 │   ├── Dockerfile.fastapi           # FastAPI image
 │   ├── Dockerfile.streamlit         # Streamlit image
 │   ├── Dockerfile.mlflow            # MLflow image
@@ -160,11 +164,11 @@ Predict the total fare for a flight.
 
 ### `GET /health`
 
-Returns service status, whether the model is loaded, active model class, and load timestamp.
+Returns service status, whether the model is loaded, active model class, load timestamp, and `instance_id` identifying which replica is responding.
 
 ### `POST /reload`
 
-Hot-swap the production model after retraining. Called automatically by the continuous training DAG, or manually:
+Hot-swap the production model after retraining. The continuous training DAG broadcasts this to **all 3 replicas** directly (bypassing the LB). For manual reload through the LB:
 
 ```bash
 curl -X POST http://localhost:8003/reload
@@ -175,9 +179,14 @@ curl -X POST http://localhost:8003/reload
 {
   "status": "reloaded",
   "model_class": "XGBRegressor",
-  "loaded_at": "2026-02-28T12:00:00+00:00"
+  "loaded_at": "2026-02-28T12:00:00+00:00",
+  "instance_id": "1"
 }
 ```
+
+### `GET /lb-health`
+
+Nginx-level health check. Returns `200 OK` if the load balancer itself is running (does **not** probe backend replicas).
 
 ### `GET /options`
 
@@ -217,7 +226,7 @@ check_drift ─┬─→ notify_retraining_started → extract_data → preproce
 5. **Champion Selection** — picks the model with the best R² on the validation set
 6. **MLflow Logging** — logs all 4 runs with tags (`model_type`, `model_family`, `champion`, `mlflow_flavour`)
 7. **Model Registry** — registers and promotes the champion to Production
-8. **Endpoint Reload** — calls `POST /reload` on the FastAPI server to hot-swap the model
+8. **Endpoint Reload** — broadcasts `POST /reload` to all 3 FastAPI replicas behind the load balancer
 9. **Slack Notifications** — at every stage (see below)
 
 ### 🔔 Slack Notifications

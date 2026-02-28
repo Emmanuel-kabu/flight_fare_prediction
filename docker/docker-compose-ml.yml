@@ -2,7 +2,8 @@
 #  Flight Fare Prediction — MLOps Stack
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Services:
-#    fastapi         – prediction API             (port 8000)
+#    nginx-lb        – Nginx load balancer        (port 8003 → 80)
+#    fastapi-1/2/3   – prediction API replicas    (port 8000 internal)
 #    streamlit       – web UI frontend            (port 8501)
 #    mlflow          – experiment tracking / model registry (port 5000)
 #    evidently       – monitoring dashboards      (port 8001)
@@ -36,8 +37,10 @@ x-airflow-common: &airflow-common
     SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
     CHANNEL_NAME: ${CHANNEL_NAME:-ml_pipeline_report}
     AIRFLOW_UI_BASE_URL: http://localhost:8082
-    # FastAPI endpoint (for reload after retraining)
-    FASTAPI_BASE_URL: http://fastapi:8000
+    # FastAPI endpoint (for reload after retraining — via load balancer)
+    FASTAPI_BASE_URL: http://nginx-lb:80
+    # Direct replica URLs for broadcast reload
+    FASTAPI_REPLICAS: http://fastapi-1:8000,http://fastapi-2:8000,http://fastapi-3:8000
   volumes:
     - ../orchestration:/opt/airflow/dags
     - ..:/opt/airflow/project
@@ -51,22 +54,70 @@ x-airflow-common: &airflow-common
       condition: service_healthy
 
 services:
-  # ─────────────── Prediction API ──────────────────────────────────────────
-  fastapi:
+  # ─────────────── Nginx Load Balancer ─────────────────────────────────────
+  nginx-lb:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.nginx
+    container_name: flight-fare-nginx-lb
+    ports:
+      - "8003:80"
+    depends_on:
+      - fastapi-1
+      - fastapi-2
+      - fastapi-3
+    networks:
+      - mlops
+    restart: unless-stopped
+
+  # ─────────────── FastAPI Replicas ────────────────────────────────────────
+  fastapi-1:
     build:
       context: ..
       dockerfile: docker/Dockerfile.fastapi
-    container_name: flight-fare-fastapi
+    container_name: flight-fare-fastapi-1
     environment:
       MLFLOW_TRACKING_URI: http://mlflow:5000
-    ports:
-      - "8003:8000"
+      INSTANCE_ID: "1"
     volumes:
       - ../artifacts:/app/artifacts
     depends_on:
       - mlflow
     networks:
       - mlops
+    restart: unless-stopped
+
+  fastapi-2:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.fastapi
+    container_name: flight-fare-fastapi-2
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      INSTANCE_ID: "2"
+    volumes:
+      - ../artifacts:/app/artifacts
+    depends_on:
+      - mlflow
+    networks:
+      - mlops
+    restart: unless-stopped
+
+  fastapi-3:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.fastapi
+    container_name: flight-fare-fastapi-3
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      INSTANCE_ID: "3"
+    volumes:
+      - ../artifacts:/app/artifacts
+    depends_on:
+      - mlflow
+    networks:
+      - mlops
+    restart: unless-stopped
 
   # ─────────────── Streamlit Frontend ──────────────────────────────────────
   streamlit:
@@ -75,11 +126,11 @@ services:
       dockerfile: docker/Dockerfile.streamlit
     container_name: flight-fare-streamlit
     environment:
-      API_URL: http://fastapi:8000
+      API_URL: http://nginx-lb:80
     ports:
       - "8501:8501"
     depends_on:
-      - fastapi
+      - nginx-lb
     networks:
       - mlops
 

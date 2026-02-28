@@ -166,7 +166,7 @@ check_drift ─┬─→ notify_retraining_started → extract_data → preproce
 | `preprocess` | Temporal split → `fit_transform` (train) → `transform` (test) |
 | `train_all_models` | `ContinuousTrainer.train_all_models()` → champion selection |
 | `log_to_mlflow` | Logs all 4 runs with tags, registers champion in Model Registry |
-| `reload_endpoint` | `POST /reload` on FastAPI to hot-swap the production model |
+| `reload_endpoint` | Broadcasts `POST /reload` to all 3 FastAPI replicas behind the LB |
 
 Each task is a `PythonOperator`. Artifacts pass between tasks via XCom and the shared filesystem.
 
@@ -188,12 +188,25 @@ Each task is a `PythonOperator`. Artifacts pass between tasks via XCom and the s
 | Component | Technology | Purpose |
 |-----------|------------|---------|
 | **`serving.py`** | FastAPI + Uvicorn | REST API — `/predict` (POST), `/reload` (POST), `/health` (GET), `/options` (GET) |
-| **`streamlit_app.py`** | Streamlit | Web UI — interactive form for flight details, calls FastAPI, displays predicted fare |
+| **`streamlit_app.py`** | Streamlit | Web UI — interactive form for flight details, calls Nginx LB, displays predicted fare |
+
+**Load-Balanced Architecture:**
+
+Three identical FastAPI replicas (`fastapi-1`, `fastapi-2`, `fastapi-3`) run behind an **Nginx 1.27-alpine** reverse-proxy load balancer using **round-robin** distribution.
+
+| Property | Value |
+|----------|-------|
+| **Algorithm** | Round-robin (default) |
+| **Health checks** | Passive — `max_fails=3`, `fail_timeout=30s` |
+| **Keepalive** | 32 upstream connections |
+| **Retry policy** | `proxy_next_upstream error timeout http_502 http_503 http_504` |
+| **LB self-check** | `GET /lb-health` returns `200 OK` |
+| **Instance ID** | Each replica reports its `INSTANCE_ID` in `/health` and `/reload` responses |
 
 **Model Loading:**
-- At startup: loads `champion_model.pkl` (falls back to `catboost_model.pkl` for backward compatibility)
-- At runtime: `POST /reload` hot-swaps the model without restarting the container
-- The `/health` endpoint reports the active model class (e.g., `XGBRegressor`, `CatBoostRegressor`)
+- At startup: each replica loads `champion_model.pkl` (falls back to `catboost_model.pkl` for backward compatibility)
+- At runtime: the continuous training DAG broadcasts `POST /reload` to **all 3 replicas** directly (bypassing the LB) to ensure every instance hot-swaps the model
+- The `/health` endpoint reports the active model class (e.g., `XGBRegressor`, `CatBoostRegressor`) and `instance_id`
 
 ### 7. Infrastructure (`docker/`)
 
@@ -201,7 +214,10 @@ All services run via `docker-compose-ml.yml`:
 
 | Service | Image / Build | Ports |
 |---------|---------------|-------|
-| `fastapi` | `Dockerfile.fastapi` | 8003 → 8000 |
+| `nginx-lb` | `Dockerfile.nginx` | 8003 → 80 |
+| `fastapi-1` | `Dockerfile.fastapi` | internal :8000 |
+| `fastapi-2` | `Dockerfile.fastapi` | internal :8000 |
+| `fastapi-3` | `Dockerfile.fastapi` | internal :8000 |
 | `streamlit` | `Dockerfile.streamlit` | 8501 → 8501 |
 | `mlflow` | `Dockerfile.mlflow` | 5000 → 5000 |
 | `evidently` | `Dockerfile.evidently` | 8001 → 8001 |
@@ -268,3 +284,4 @@ artifacts/    Evidently Reports
 9. **Slack notifications at every stage** — drift detected, retraining started/failed/completed, model promoted — full visibility into the ML lifecycle
 10. **Airflow for orchestration** — two DAGs (weekly training + drift-triggered continuous training) with shared notification infrastructure
 11. **Docker Compose** — single-command deployment of the entire MLOps stack
+12. **Nginx load balancer** — round-robin across 3 FastAPI replicas with passive health checks, automatic failover (`proxy_next_upstream`), and broadcast reload to ensure all instances serve the latest model

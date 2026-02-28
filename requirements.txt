@@ -18,6 +18,7 @@ lightgbm
 fastapi
 uvicorn[standard]
 pydantic
+requests
 
 # Experiment tracking / model registry
 mlflow

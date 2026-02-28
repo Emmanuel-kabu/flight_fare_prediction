@@ -28,6 +28,12 @@ from pathlib import Path
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 
+from slack_notifications import (
+    notify_pipeline_started,
+    notify_task_failure,
+    notify_pipeline_complete,
+)
+
 # ── Project root inside the container ────────────────────────────────────────
 PROJECT_ROOT = Path(os.getenv("PROJECT_ROOT", "/opt/airflow/project"))
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -52,6 +58,7 @@ default_args = {
     "email_on_retry": False,
     "retries": 1,
     "retry_delay": timedelta(minutes=5),
+    "on_failure_callback": notify_task_failure,
 }
 
 
@@ -281,7 +288,7 @@ def task_evidently_monitoring(**context):
 
 
 def task_notify_complete(**context):
-    """Final task — print summary."""
+    """Final task — print summary and send Slack notification."""
     eval_result = context["ti"].xcom_pull(task_ids="evaluation")
     mlflow_result = context["ti"].xcom_pull(task_ids="mlflow_logging")
     evidently_result = context["ti"].xcom_pull(task_ids="evidently_monitoring")
@@ -299,6 +306,9 @@ def task_notify_complete(**context):
         print(f"  Evidently reports    = ✅")
     print("=" * 60)
 
+    # Send Slack completion notification
+    notify_pipeline_complete(context)
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  DAG definition
@@ -314,6 +324,11 @@ with DAG(
     tags=["ml", "flight-fare", "catboost"],
     max_active_runs=1,
 ) as dag:
+
+    t_slack_start = PythonOperator(
+        task_id="slack_pipeline_started",
+        python_callable=notify_pipeline_started,
+    )
 
     t_extract = PythonOperator(
         task_id="data_extraction",
@@ -351,5 +366,5 @@ with DAG(
     )
 
     # ── Task dependencies (pipeline graph) ──
-    t_extract >> t_preprocess >> t_train >> t_evaluate
+    t_slack_start >> t_extract >> t_preprocess >> t_train >> t_evaluate
     t_evaluate >> [t_mlflow, t_evidently] >> t_notify
